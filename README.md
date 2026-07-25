@@ -30,15 +30,6 @@ riscv-openocd = "*"
 
 Or globally: `pixi global install -c https://prefix.dev/eliacereda riscv-openocd`.
 
-Note: the channel's sharded repodata is currently broken server-side; if
-`pixi add`/`pixi install` fails, add to `.pixi/config.toml` (workspace) or
-`~/.pixi/config.toml` (global):
-
-```toml
-[repodata-config."https://prefix.dev"]
-disable-sharded = true
-```
-
 ### Version numbering
 
 Upstream identifies itself as `0.10.0+dev`; conda forbids `+`, so the package

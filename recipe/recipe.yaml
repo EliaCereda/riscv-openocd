@@ -1,0 +1,84 @@
+schema_version: 1
+
+context:
+  # riscv/riscv-openocd at the exact commit GAP SDK 5.21.7's Makefile pins
+  # (short SHA 1449af5bd). Upstream identifies itself as 0.10.0+dev; conda
+  # forbids "+", so the version is <base>.<commit-date>. Do NOT upgrade this
+  # pin: the SDK's Tcl scripts use pre-0.12 deprecated syntax (interface ftdi,
+  # ftdi_vid_pid, adapter_khz, ...) that modern OpenOCD removed.
+  version: "0.10.0.20200220"
+  openocd_rev: 1449af5bdb99052c2f3bf92747f8438544cd8f3f
+
+package:
+  name: riscv-openocd
+  version: ${{ version }}
+
+source:
+  # rattler-build checks out git submodules recursively, so this also brings
+  # in jimtcl @ the pinned gitlink (msteveb/jimtcl 51f65c6d = v0.76) — the
+  # only submodule at this commit; ./bootstrap runs with "nosubmodule" so no
+  # network is touched during the build. libjaylink is NOT a submodule here —
+  # it is vendored in-tree at src/jtag/drivers/libjaylink.
+  - git: https://github.com/riscv/riscv-openocd.git
+    rev: ${{ openocd_rev }}
+
+build:
+  number: 0
+  # Normal prefix relocation (unlike the sibling toolchain recipes): openocd
+  # bakes $PREFIX/share/openocd/scripts into the binary via PKGDATADIR and
+  # links conda's libusb/libftdi via rpath — both need install-time rewriting.
+
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ stdlib('c') }}
+    - make
+    - autoconf
+    - automake
+    - libtool
+    - pkg-config
+    - texinfo
+    # modern config.guess/config.sub: jimtcl 0.76's bundled autosetup copies
+    # predate aarch64 hosts
+    - gnuconfig
+  host:
+    - libusb
+    - libftdi 1.5.*
+  run:
+    # libftdi publishes no run_exports on conda-forge (verified: the test env
+    # solved without libftdi1.so.2), so the runtime deps must be explicit.
+    - libusb
+    - libftdi 1.5.*
+
+tests:
+  - script:
+      - openocd --version
+      # The SDK contract in one line: the FTDI (MPSSE) adapter driver exists
+      # and still accepts the deprecated pre-0.12 command spellings that the
+      # GAP SDK's Tcl scripts use. shutdown precedes init, so no hardware is
+      # touched and openocd exits 0.
+      - openocd -c "interface ftdi" -c "ftdi_vid_pid 0x0403 0x6010" -c "shutdown"
+  - package_contents:
+      files:
+        # gap-sdk's configs/jlink.sh resolves interface/jlink.cfg from this
+        # installed scripts dir, so it must ship.
+        - share/openocd/scripts/interface/jlink.cfg
+        # udev rules for real boards; no source checkout exists at runtime.
+        - share/openocd/contrib/60-openocd.rules
+        - bin/openocd
+
+about:
+  summary: OpenOCD (riscv/riscv-openocd) at the GAP SDK 5.21.7 pin, with FTDI and J-Link support
+  description: |
+    Open On-Chip Debugger built from the exact riscv-openocd commit the
+    GreenWaves GAP SDK 5.21.7 pins (1449af5bd, "0.10.0+dev", 2020-02-20),
+    configured as the SDK does (--enable-jtag_dpi --disable-werror). Pure
+    upstream source, no patches. Intended as the `openocd` binary for the
+    pixi-based GAP SDK; the GAP9-specific logic is Tcl inside the SDK tree.
+  license: GPL-2.0-or-later
+  license_file:
+    - COPYING
+    - jimtcl/LICENSE
+    - src/jtag/drivers/libjaylink/COPYING
+  homepage: https://github.com/riscv/riscv-openocd
+  repository: https://github.com/riscv/riscv-openocd

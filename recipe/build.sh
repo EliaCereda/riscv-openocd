@@ -15,6 +15,9 @@ export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
 # --disable-werror does not cover these: they are default errors, not -Werror.
 if [[ "$(uname)" == "Darwin" ]]; then
   export CFLAGS="${CFLAGS:-} -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion"
+  # libjaylink's autogen.sh hardcodes the Homebrew name glibtoolize on
+  # Darwin; conda's libtool ships plain libtoolize.
+  ln -sf "$BUILD_PREFIX/bin/libtoolize" "$BUILD_PREFIX/bin/glibtoolize"
 fi
 
 # "nosubmodule": jimtcl is provided as a pinned rattler-build source; the

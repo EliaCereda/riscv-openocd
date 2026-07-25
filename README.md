@@ -3,8 +3,9 @@
 Open On-Chip Debugger built from [riscv/riscv-openocd](https://github.com/riscv/riscv-openocd)
 at commit `1449af5bd` ("0.10.0+dev", 2020-02-20) — the exact pin the
 GreenWaves GAP SDK 5.21.7 Makefile uses — packaged with
-[rattler-build](https://rattler.build) for `linux-64` and `linux-aarch64`,
-published to [prefix.dev/eliacereda](https://prefix.dev/channels/eliacereda).
+[rattler-build](https://rattler.build) for `linux-64`, `linux-aarch64`,
+`osx-arm64` and `osx-64`, published to
+[prefix.dev/eliacereda](https://prefix.dev/channels/eliacereda).
 
 Pure upstream source, zero patches, configured as the SDK does
 (`--enable-jtag_dpi --disable-werror`). All GAP9-specific logic is Tcl inside
@@ -21,7 +22,7 @@ hardware.
 ```toml
 [workspace]
 channels = ["https://prefix.dev/eliacereda", "conda-forge"]
-platforms = ["linux-64", "linux-aarch64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64"]
 
 [dependencies]
 riscv-openocd = "*"
@@ -62,10 +63,12 @@ $SRC_DIR/                     riscv/riscv-openocd @ 1449af5bd
 pixi run build     # rattler-build build --recipe recipe/recipe.yaml
 ```
 
-Builds in a few minutes. Uses conda-forge gcc 13 + sysroot 2.28 (see
-`recipe/variants.yaml`) so the only system requirement is `__glibc >=2.28`,
-Pixi's default solve baseline. `libusb`/`libftdi` come from conda-forge as
-host dependencies and stay as runtime dependencies of the package.
+Builds in a few minutes. On Linux, uses conda-forge gcc 13 + sysroot 2.28
+(see `recipe/variants.yaml`) so the only system requirement is
+`__glibc >=2.28`, Pixi's default solve baseline; on macOS, conda-forge
+clang 18 with deployment target 11.0. `libusb`/`libftdi` come from
+conda-forge as host dependencies and stay as runtime dependencies of the
+package.
 
 Notable recipe details:
 
@@ -90,8 +93,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## CI and publishing
 
-GitHub Actions builds both platforms natively (`ubuntu-24.04`,
-`ubuntu-24.04-arm`). On failure the tail of the build log is posted as a
+GitHub Actions builds all four platforms natively (`ubuntu-24.04`,
+`ubuntu-24.04-arm`, `macos-15`, `macos-15-intel`). On failure the tail of the build log is posted as a
 commit comment. Uploads to prefix.dev are tag-gated and use OIDC trusted
 publishing (no API key).
 

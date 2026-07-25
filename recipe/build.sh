@@ -10,6 +10,13 @@ find . -name config.guess -exec cp -f "$BUILD_PREFIX/share/gnuconfig/config.gues
 # consideration entirely: libusb/libftdi must come from the host prefix.
 export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
 
+# clang >= 16 makes implicit function declarations (and friends) hard errors
+# by default; downgrade them back to warnings for these 2020-era sources.
+# --disable-werror does not cover these: they are default errors, not -Werror.
+if [[ "$(uname)" == "Darwin" ]]; then
+  export CFLAGS="${CFLAGS:-} -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion"
+fi
+
 # "nosubmodule": jimtcl is provided as a pinned rattler-build source; the
 # vendored libjaylink's autogen.sh still runs. No network.
 ./bootstrap nosubmodule
@@ -24,6 +31,9 @@ grep -E "SEGGER J-Link Programmer.*yes" configure.log
 make -j"$CPU_COUNT"
 make install
 
-# udev rules for real boards; make install does not ship them and consumers
-# have no source checkout to copy them from.
-install -D -m 644 contrib/60-openocd.rules "$PREFIX/share/openocd/contrib/60-openocd.rules"
+# udev rules for real boards (Linux consumers); make install does not ship
+# them and consumers have no source checkout to copy them from. Shipped on
+# all platforms for a uniform layout. (No `install -D`: BSD install on macOS
+# lacks it.)
+mkdir -p "$PREFIX/share/openocd/contrib"
+install -m 644 contrib/60-openocd.rules "$PREFIX/share/openocd/contrib/60-openocd.rules"

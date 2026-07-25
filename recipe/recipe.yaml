@@ -23,7 +23,7 @@ source:
     rev: ${{ openocd_rev }}
 
 build:
-  number: 0
+  number: 1
   # Normal prefix relocation (unlike the sibling toolchain recipes): openocd
   # bakes $PREFIX/share/openocd/scripts into the binary via PKGDATADIR and
   # links conda's libusb/libftdi via rpath — both need install-time rewriting.

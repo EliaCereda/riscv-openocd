@@ -21,9 +21,14 @@ source:
   # it is vendored in-tree at src/jtag/drivers/libjaylink.
   - git: https://github.com/riscv/riscv-openocd.git
     rev: ${{ openocd_rev }}
+    patches:
+      # GAP9: `riscv gap9_hwloop_step_fix on` counts the hardware-loop
+      # iteration that GAP9's core skips when single-stepped over a loop's end
+      # (gap-llvm-toolchain ROADMAP §5.7, WP D1f; owner Q36).
+      - patches/0001-riscv-gap9-hwloop-step-fix.patch
 
 build:
-  number: 1
+  number: 3
   # Normal prefix relocation (unlike the sibling toolchain recipes): openocd
   # bakes $PREFIX/share/openocd/scripts into the binary via PKGDATADIR and
   # links conda's libusb/libftdi via rpath — both need install-time rewriting.
@@ -72,9 +77,12 @@ about:
   description: |
     Open On-Chip Debugger built from the exact riscv-openocd commit the
     GreenWaves GAP SDK 5.21.7 pins (1449af5bd, "0.10.0+dev", 2020-02-20),
-    configured as the SDK does (--enable-jtag_dpi --disable-werror). Pure
-    upstream source, no patches. Intended as the `openocd` binary for the
-    pixi-based GAP SDK; the GAP9-specific logic is Tcl inside the SDK tree.
+    configured as the SDK does (--enable-jtag_dpi --disable-werror). Upstream
+    source plus one GAP9 patch: `riscv gap9_hwloop_step_fix on` decrements a
+    hardware loop's count after a debug single step over the loop's end, which
+    GAP9's core doesn't (off unless the GAP9 Tcl turns it on). Intended as the
+    `openocd` binary for the pixi-based GAP SDK; the rest of the GAP9-specific
+    logic is Tcl inside the SDK tree.
   license: GPL-2.0-or-later
   license_file:
     - COPYING

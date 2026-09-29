@@ -7,9 +7,21 @@ GreenWaves GAP SDK 5.21.7 Makefile uses — packaged with
 `osx-arm64` and `osx-64`, published to
 [prefix.dev/eliacereda](https://prefix.dev/channels/eliacereda).
 
-Pure upstream source, zero patches, configured as the SDK does
-(`--enable-jtag_dpi --disable-werror`). All GAP9-specific logic is Tcl inside
-the SDK tree (`utils/openocd_tools/`), not compiled code.
+Upstream source plus one GAP9 patch (`recipe/patches/`), configured as the SDK
+does (`--enable-jtag_dpi --disable-werror`). The rest of the GAP9-specific
+logic is Tcl inside the SDK tree (`utils/openocd_tools/`).
+
+**The GAP9 patch** (build 3): GAP9's core, single-stepped over a hardware
+loop's last instruction with the count above 1, jumps back to the loop's start
+without decrementing the count (loop 0: CSRs 0x7C0-0x7C2, loop 1: 0x7C4-0x7C6),
+so every debugger step or breakpoint step-over there added an iteration the
+program never asked for (measured on the EVK: gap-llvm-toolchain ROADMAP §5.7,
+WP D1f). `riscv gap9_hwloop_step_fix on` (off by default; global, like the other `riscv set_*`
+settings, since the GAP9 Tcl runs it before `init`) makes
+`riscv_openocd_step()` read pc and the six loop CSRs before a step and, when the
+step went from a loop's end back to its start, write the count minus one. Both
+loops ending on the same instruction (no compiler emits it) is left as is, with
+a warning.
 
 **Why this exact 2020 commit:** the SDK's Tcl scripts use pre-0.12 deprecated
 command spellings (`interface ftdi`, `ftdi_vid_pid`, `ftdi_layout_init`,

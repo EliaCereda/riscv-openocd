@@ -1,0 +1,147 @@
+diff --git a/src/target/riscv/riscv.c b/src/target/riscv/riscv.c
+index ae0489768..de2037297 100644
+--- a/src/target/riscv/riscv.c
++++ b/src/target/riscv/riscv.c
+@@ -258,6 +258,8 @@ bool riscv_ebreaku = true;
+ 
+ bool riscv_enable_virtual;
+ 
++bool riscv_gap9_hwloop_step_fix;
++
+ typedef struct {
+ 	uint16_t low, high;
+ } range_t;
+@@ -2040,6 +2042,64 @@ int riscv_openocd_poll(struct target *target)
+ 	return ERROR_OK;
+ }
+ 
++/* GAP9's hardware loops: loop 0 (the outer one) has its start, end and count
++ * in CSRs 0x7C0-0x7C2, loop 1 (the inner one) in 0x7C4-0x7C6; the end is the
++ * loop's last instruction, and the count includes the current iteration.
++ * GAP9's core, single-stepped (dcsr.step) over a loop's end with the count
++ * above 1, jumps back to the loop's start but doesn't decrement the count: a
++ * debugger's step or breakpoint step-over there adds an iteration the program
++ * never asked for. With gap9_hwloop_step_fix on, the step decrements it. */
++enum { GAP9_LPSTART, GAP9_LPEND, GAP9_LPCOUNT };
++
++static enum gdb_regno gap9_hwloop_csr(int loop, int which)
++{
++	return GDB_REGNO_CSR0 + 0x7c0 + 4 * loop + which;
++}
++
++static int gap9_hwloop_read(struct target *target, riscv_reg_t *pc,
++		riscv_reg_t lp[2][3])
++{
++	if (riscv_get_register(target, pc, GDB_REGNO_PC) != ERROR_OK)
++		return ERROR_FAIL;
++	for (int loop = 0; loop < 2; loop++)
++		for (int which = GAP9_LPSTART; which <= GAP9_LPCOUNT; which++)
++			if (riscv_get_register(target, &lp[loop][which],
++						gap9_hwloop_csr(loop, which)) != ERROR_OK)
++				return ERROR_FAIL;
++	return ERROR_OK;
++}
++
++static int gap9_hwloop_after_step(struct target *target, riscv_reg_t pc,
++		riscv_reg_t lp[2][3])
++{
++	bool ends[2] = {
++		lp[0][GAP9_LPEND] == pc && lp[0][GAP9_LPCOUNT] > 1,
++		lp[1][GAP9_LPEND] == pc && lp[1][GAP9_LPCOUNT] > 1
++	};
++	if (!ends[0] && !ends[1])
++		return ERROR_OK;
++	if (ends[0] && ends[1]) {
++		/* Silicon runs such a nest in its own way (the inner loop twice
++		 * per outer iteration); no compiler makes one. Leave it be. */
++		LOG_WARNING("both hardware loops end at 0x%" PRIx64 ": their counts "
++				"are not corrected for this step", pc);
++		return ERROR_OK;
++	}
++	int loop = ends[1] ? 1 : 0;
++	riscv_reg_t next_pc;
++	if (riscv_get_register(target, &next_pc, GDB_REGNO_PC) != ERROR_OK)
++		return ERROR_FAIL;
++	/* Only a step that went back to the loop's start is an iteration. */
++	if (next_pc != lp[loop][GAP9_LPSTART])
++		return ERROR_OK;
++	LOG_DEBUG("hardware loop %d: count %" PRIu64 " -> %" PRIu64 " after the step over its end",
++			loop, lp[loop][GAP9_LPCOUNT], lp[loop][GAP9_LPCOUNT] - 1);
++	int result = riscv_set_register(target, gap9_hwloop_csr(loop, GAP9_LPCOUNT),
++			lp[loop][GAP9_LPCOUNT] - 1);
++	register_cache_invalidate(target->reg_cache);
++	return result;
++}
++
+ int riscv_openocd_step(
+ 		struct target *target,
+ 		int current,
+@@ -2051,6 +2111,10 @@ int riscv_openocd_step(
+ 	if (!current)
+ 		riscv_set_register(target, GDB_REGNO_PC, address);
+ 
++	riscv_reg_t hwloop_pc = 0, hwloop[2][3];
++	bool hwloop_fix = riscv_gap9_hwloop_step_fix &&
++		gap9_hwloop_read(target, &hwloop_pc, hwloop) == ERROR_OK;
++
+ 	int out = riscv_step_rtos_hart(target);
+ 	if (out != ERROR_OK) {
+ 		LOG_ERROR("unable to step rtos hart");
+@@ -2058,6 +2122,9 @@ int riscv_openocd_step(
+ 	}
+ 
+ 	register_cache_invalidate(target->reg_cache);
++
++	if (hwloop_fix && gap9_hwloop_after_step(target, hwloop_pc, hwloop) != ERROR_OK)
++		LOG_WARNING("unable to correct the GAP9 hardware-loop count after the step");
+ 	target->state = TARGET_RUNNING;
+ 	target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+ 	target->state = TARGET_HALTED;
+@@ -2129,6 +2196,16 @@ COMMAND_HANDLER(riscv_set_prefer_sba)
+ 	return ERROR_OK;
+ }
+ 
++COMMAND_HANDLER(riscv_set_gap9_hwloop_step_fix)
++{
++	if (CMD_ARGC != 1) {
++		LOG_ERROR("Command takes exactly 1 parameter");
++		return ERROR_COMMAND_SYNTAX_ERROR;
++	}
++	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], riscv_gap9_hwloop_step_fix);
++	return ERROR_OK;
++}
++
+ COMMAND_HANDLER(riscv_set_enable_virtual)
+ {
+ 	if (CMD_ARGC != 1) {
+@@ -2528,6 +2605,15 @@ static const struct command_registration riscv_exec_command_handlers[] = {
+ 		.help = "When on, prefer to use System Bus Access to access memory. "
+ 			"When off, prefer to use the Program Buffer to access memory."
+ 	},
++	{
++		.name = "gap9_hwloop_step_fix",
++		.handler = riscv_set_gap9_hwloop_step_fix,
++		.mode = COMMAND_ANY,
++		.usage = "riscv gap9_hwloop_step_fix on|off",
++		.help = "GAP9: after a single step over a hardware loop's end that went "
++			"back to its start, decrement the loop's count (CSR 0x7C2 or "
++			"0x7C6), which GAP9's core doesn't do in a debug step."
++	},
+ 	{
+ 		.name = "set_enable_virtual",
+ 		.handler = riscv_set_enable_virtual,
+diff --git a/src/target/riscv/riscv.h b/src/target/riscv/riscv.h
+index 928e460ec..1973b1f63 100644
+--- a/src/target/riscv/riscv.h
++++ b/src/target/riscv/riscv.h
+@@ -195,6 +195,10 @@ extern int riscv_reset_timeout_sec;
+ extern bool riscv_prefer_sba;
+ 
+ extern bool riscv_enable_virtual;
++
++/* GAP9 (riscv gap9_hwloop_step_fix on): count the hardware-loop iteration that
++ * the core's single step over a loop's end doesn't. */
++extern bool riscv_gap9_hwloop_step_fix;
+ extern bool riscv_ebreakm;
+ extern bool riscv_ebreaks;
+ extern bool riscv_ebreaku;

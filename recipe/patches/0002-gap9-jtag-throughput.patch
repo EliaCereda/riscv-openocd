@@ -1,0 +1,563 @@
+diff --git a/doc/openocd.texi b/doc/openocd.texi
+index 0e92a9dee..a72586e1c 100644
+--- a/doc/openocd.texi
++++ b/doc/openocd.texi
+@@ -2301,6 +2301,14 @@ MMU: disabled, D-Cache: disabled, I-Cache: enabled
+ @end example
+ @end deffn
+ 
++@deffn Command target_poll_interval [milliseconds]
++Set or show how often the targets are polled in the background
++(default 100 ms). A shorter interval notices sooner that a target
++halted, at the cost of more adapter traffic while it runs. The server
++loop sleeps up to @command{poll_period} ms between polls, so set that
++no longer than this.
++@end deffn
++
+ @node Debug Adapter Configuration
+ @chapter Debug Adapter Configuration
+ @cindex config file, interface
+diff --git a/src/target/riscv/riscv-013.c b/src/target/riscv/riscv-013.c
+index 487ed50e9..c6e566cf9 100644
+--- a/src/target/riscv/riscv-013.c
++++ b/src/target/riscv/riscv-013.c
+@@ -2595,6 +2595,179 @@ static int batch_run(const struct target *target, struct riscv_batch *batch)
+ 	return riscv_batch_run(batch);
+ }
+ 
++/* System bus reads and writes (sbversion 1) are queued in batches of up to
++ * this many sbdata0 accesses, each batch one JTAG queue flush. */
++#define SB_BATCH_WORDS 1023
++
++/* Queue the sbaddress writes of sb_write_address() in a batch. */
++static void sb_batch_add_address(struct target *target, struct riscv_batch *batch,
++		target_addr_t address)
++{
++	RISCV013_INFO(info);
++	unsigned sbasize = get_field(info->sbcs, DMI_SBCS_SBASIZE);
++	if (sbasize > 96)
++		riscv_batch_add_dmi_write(batch, DMI_SBADDRESS3, 0);
++	if (sbasize > 64)
++		riscv_batch_add_dmi_write(batch, DMI_SBADDRESS2, 0);
++	if (sbasize > 32)
++#if BUILD_TARGET64
++		riscv_batch_add_dmi_write(batch, DMI_SBADDRESS1, address >> 32);
++#else
++		riscv_batch_add_dmi_write(batch, DMI_SBADDRESS1, 0);
++#endif
++	riscv_batch_add_dmi_write(batch, DMI_SBADDRESS0, address);
++}
++
++/* After a batch hit DMI busy: clear it, wait for the system bus to go idle,
++ * and clear an sbbusyerror (reported in *sbbusyerror). A bus error fails. */
++static int sb_batch_recover(struct target *target, bool *sbbusyerror)
++{
++	increase_dmi_busy_delay(target);	/* also dmireset */
++	uint32_t sbcs;
++	if (read_sbcs_nonbusy(target, &sbcs) != ERROR_OK)
++		return ERROR_FAIL;
++	if (get_field(sbcs, DMI_SBCS_SBERROR)) {
++		dmi_write(target, DMI_SBCS, DMI_SBCS_SBERROR);
++		return ERROR_FAIL;
++	}
++	*sbbusyerror = get_field(sbcs, DMI_SBCS_SBBUSYERROR);
++	if (*sbbusyerror && dmi_write(target, DMI_SBCS, DMI_SBCS_SBBUSYERROR) != ERROR_OK)
++		return ERROR_FAIL;
++	return ERROR_OK;
++}
++
++/**
++ * Read memory over the system bus in batches, for accesses of at most 4 bytes
++ * (one sbdata0 read per element).
++ *
++ * With sbreadondata set, each read of sbdata0 returns one element and starts
++ * the bus read of the next, so a batch reads up to SB_BATCH_WORDS elements in
++ * one JTAG flush. The first batch also writes sbcs and sbaddress, and each
++ * batch ends with a read of sbcs. The last element is read in a batch of its
++ * own, after sbreadondata is cleared, so no bus read goes past the end; the
++ * debugger may write sbcs only once sbbusy is seen low, which the previous
++ * batch's sbcs read shows. A read of a single element is one batch.
++ *
++ * A DMI busy anywhere in a batch drops the rest of it: the batch restarts at
++ * the first lost element with more idle cycles. An sbbusyerror (an sbdata0
++ * read overtook a bus read) restarts the whole batch with a longer bus read
++ * delay.
++ */
++static int read_memory_bus_v1_batched(struct target *target, target_addr_t address,
++		uint32_t size, uint32_t count, uint8_t *buffer)
++{
++	RISCV013_INFO(info);
++	uint32_t sbcs_write = set_field(0, DMI_SBCS_SBREADONADDR, 1);
++	sbcs_write |= sb_sbaccess(size);
++	sbcs_write = set_field(sbcs_write, DMI_SBCS_SBAUTOINCREMENT, 1);
++
++	uint32_t next = 0;	/* the first element the next batch reads */
++	bool setup = true;	/* the next batch must write sbcs and sbaddress first */
++	bool sbbusy = false;	/* the last sbcs read saw sbbusy */
++	time_t start = time(NULL);
++
++	while (next < count) {
++		if (time(NULL) - start > riscv_command_timeout_sec) {
++			LOG_ERROR("No progress for %ds reading memory over the system bus. "
++					"Increase the timeout with riscv set_command_timeout_sec.",
++					riscv_command_timeout_sec);
++			return ERROR_FAIL;
++		}
++
++		bool last = next == count - 1;
++		if (last && !setup && sbbusy) {
++			/* sbcs may be written only once sbbusy is low. */
++			uint32_t sbcs;
++			if (read_sbcs_nonbusy(target, &sbcs) != ERROR_OK)
++				return ERROR_FAIL;
++			if (get_field(sbcs, DMI_SBCS_SBERROR)) {
++				dmi_write(target, DMI_SBCS, DMI_SBCS_SBERROR);
++				return ERROR_FAIL;
++			}
++		}
++
++		struct riscv_batch *batch = riscv_batch_alloc(target, SB_BATCH_WORDS + 8,
++				info->dmi_busy_delay + info->bus_master_read_delay);
++		if (setup || last)
++			riscv_batch_add_dmi_write(batch, DMI_SBCS,
++					set_field(sbcs_write, DMI_SBCS_SBREADONDATA, !last));
++		if (setup)	/* This address write starts the bus read of element next. */
++			sb_batch_add_address(target, batch, address + next * size);
++		uint32_t n = last ? 1 : MIN(SB_BATCH_WORDS, count - 1 - next);
++		size_t first_key = riscv_batch_add_dmi_read(batch, DMI_SBDATA0);
++		for (uint32_t i = 1; i < n; i++)
++			riscv_batch_add_dmi_read(batch, DMI_SBDATA0);
++		size_t sbcs_key = riscv_batch_add_dmi_read(batch, DMI_SBCS);
++
++		if (batch_run(target, batch) != ERROR_OK) {
++			riscv_batch_free(batch);
++			return ERROR_FAIL;
++		}
++
++		/* The elements read before a DMI busy, if any. */
++		uint32_t ok = 0;
++		dmi_status_t status = DMI_STATUS_SUCCESS;
++		for (; ok <= n; ok++) {
++			status = get_field(riscv_batch_get_dmi_read(batch, ok < n ? first_key + ok : sbcs_key),
++					DTM_DMI_OP);
++			if (status != DMI_STATUS_SUCCESS)
++				break;
++		}
++		if (status == DMI_STATUS_FAILED) {
++			LOG_ERROR("Failed system bus read at 0x%" TARGET_PRIxADDR, address + (next + ok) * size);
++			riscv_batch_free(batch);
++			return ERROR_FAIL;
++		}
++
++		bool sbbusyerror;
++		if (status == DMI_STATUS_BUSY) {
++			if (sb_batch_recover(target, &sbbusyerror) != ERROR_OK) {
++				riscv_batch_free(batch);
++				return ERROR_FAIL;
++			}
++			LOG_INFO("System bus read: DMI busy at element %u of %u, retrying with %d idle cycles",
++					MIN(ok, n), n, info->dmi_busy_delay);
++		} else {
++			uint32_t sbcs = get_field(riscv_batch_get_dmi_read(batch, sbcs_key), DTM_DMI_DATA);
++			if (get_field(sbcs, DMI_SBCS_SBERROR)) {
++				riscv_batch_free(batch);
++				dmi_write(target, DMI_SBCS, DMI_SBCS_SBERROR);
++				return ERROR_FAIL;
++			}
++			sbbusyerror = get_field(sbcs, DMI_SBCS_SBBUSYERROR);
++			if (sbbusyerror) {
++				uint32_t idle;
++				if (dmi_write(target, DMI_SBCS, DMI_SBCS_SBBUSYERROR) != ERROR_OK ||
++						read_sbcs_nonbusy(target, &idle) != ERROR_OK) {
++					riscv_batch_free(batch);
++					return ERROR_FAIL;
++				}
++			}
++			sbbusy = get_field(sbcs, DMI_SBCS_SBBUSY);
++		}
++
++		if (sbbusyerror) {
++			/* An sbdata0 read overtook a bus read: any element may be stale. */
++			info->bus_master_read_delay += info->bus_master_read_delay / 10 + 1;
++			LOG_INFO("System bus read: sbbusyerror, retrying with a bus read delay of %d",
++					info->bus_master_read_delay);
++			ok = 0;
++		}
++		for (uint32_t i = 0; i < MIN(ok, n); i++) {
++			uint32_t value = get_field(riscv_batch_get_dmi_read(batch, first_key + i), DTM_DMI_DATA);
++			write_to_buf(buffer + (next + i) * size, value, size);
++			log_memory_access(address + (next + i) * size, value, size, true);
++		}
++		riscv_batch_free(batch);
++		next += MIN(ok, n);
++		if (ok > 0)
++			start = time(NULL);
++		/* After a DMI busy or an sbbusyerror the bus address is unknown. */
++		setup = status != DMI_STATUS_SUCCESS || sbbusyerror;
++	}
++	return ERROR_OK;
++}
++
+ /*
+  * Performs a memory read using memory access abstract commands. The read sizes
+  * supported are 1, 2, and 4 bytes despite the spec's support of 8 and 16 byte
+@@ -3146,8 +3319,11 @@ static int read_memory(struct target *target, target_addr_t address,
+ 			(get_field(info->sbcs, DMI_SBCS_SBACCESS128) && size == 16)) {
+ 		if (get_field(info->sbcs, DMI_SBCS_SBVERSION) == 0)
+ 			return read_memory_bus_v0(target, address, size, count, buffer);
+-		else if (get_field(info->sbcs, DMI_SBCS_SBVERSION) == 1)
++		else if (get_field(info->sbcs, DMI_SBCS_SBVERSION) == 1) {
++			if (size <= 4)
++				return read_memory_bus_v1_batched(target, address, size, count, buffer);
+ 			return read_memory_bus_v1(target, address, size, count, buffer);
++		}
+ 	}
+ 
+ 	if (info->progbufsize >= 2)
+@@ -3246,34 +3422,58 @@ static int write_memory_bus_v0(struct target *target, target_addr_t address,
+ 	return ERROR_OK;
+ }
+ 
++/**
++ * Write memory over the system bus in batches of up to SB_BATCH_WORDS sbdata
++ * writes, each batch one JTAG flush. The first batch also writes sbcs and
++ * sbaddress, and each batch ends with a read of sbcs.
++ *
++ * The setup is checked by reading sbaddress0 back right after it: a DMI busy
++ * there (which drops the rest of the batch) means the setup may not have
++ * landed, so the batch starts over. After a DMI busy later in the batch, or an
++ * sbbusyerror (a write while the bus was busy; the debug module then starts no
++ * more bus accesses until it is cleared), the write resumes at sbaddress with
++ * more idle cycles.
++ */
+ static int write_memory_bus_v1(struct target *target, target_addr_t address,
+ 		uint32_t size, uint32_t count, const uint8_t *buffer)
+ {
+ 	RISCV013_INFO(info);
+-	uint32_t sbcs = sb_sbaccess(size);
+-	sbcs = set_field(sbcs, DMI_SBCS_SBAUTOINCREMENT, 1);
+-	dmi_write(target, DMI_SBCS, sbcs);
++	uint32_t sbcs_write = sb_sbaccess(size);
++	sbcs_write = set_field(sbcs_write, DMI_SBCS_SBAUTOINCREMENT, 1);
+ 
+ 	target_addr_t next_address = address;
+ 	target_addr_t end_address = address + count * size;
++	bool setup = true;	/* the next batch must write sbcs and sbaddress first */
++	time_t start = time(NULL);
+ 
+-	int result;
+-
+-	sb_write_address(target, next_address);
+ 	while (next_address < end_address) {
++		if (time(NULL) - start > riscv_command_timeout_sec) {
++			LOG_ERROR("No progress for %ds writing memory over the system bus. "
++					"Increase the timeout with riscv set_command_timeout_sec.",
++					riscv_command_timeout_sec);
++			return ERROR_FAIL;
++		}
+ 		LOG_DEBUG("transferring burst starting at address 0x%" TARGET_PRIxADDR,
+ 				next_address);
+ 
+-		struct riscv_batch *batch = riscv_batch_alloc(
+-				target,
+-				32,
++		struct riscv_batch *batch = riscv_batch_alloc(target, SB_BATCH_WORDS + 8,
+ 				info->dmi_busy_delay + info->bus_master_write_delay);
++		size_t setup_key = 0;
++		if (setup) {
++			riscv_batch_add_dmi_write(batch, DMI_SBCS, sbcs_write);
++			sb_batch_add_address(target, batch, next_address);
++			/* sbaddress0 read back: its status shows whether the setup writes landed. */
++			setup_key = riscv_batch_add_dmi_read(batch, DMI_SBADDRESS0);
++		}
+ 
++		target_addr_t batch_address = next_address;
++		unsigned words = 0;
+ 		for (uint32_t i = (next_address - address) / size; i < count; i++) {
+ 			const uint8_t *p = buffer + i * size;
+ 
+-			if (riscv_batch_available_scans(batch) < (size + 3) / 4)
++			if (words + (size + 3) / 4 > SB_BATCH_WORDS)
+ 				break;
++			words += (size + 3) / 4;
+ 
+ 			if (size > 12)
+ 				riscv_batch_add_dmi_write(batch, DMI_SBDATA3,
+@@ -3306,57 +3506,85 @@ static int write_memory_bus_v1(struct target *target, target_addr_t address,
+ 			log_memory_access(address + i * size, value, size, false);
+ 			next_address += size;
+ 		}
++		size_t sbcs_key = riscv_batch_add_dmi_read(batch, DMI_SBCS);
+ 
+-		result = batch_run(target, batch);
++		if (batch_run(target, batch) != ERROR_OK) {
++			riscv_batch_free(batch);
++			return ERROR_FAIL;
++		}
++		uint64_t setup_in = setup ? riscv_batch_get_dmi_read(batch, setup_key) : 0;
++		uint64_t sbcs_in = riscv_batch_get_dmi_read(batch, sbcs_key);
+ 		riscv_batch_free(batch);
+-		if (result != ERROR_OK)
+-			return result;
+ 
+-		bool dmi_busy_encountered;
+-		if (dmi_op(target, &sbcs, &dmi_busy_encountered, DMI_OP_READ,
+-				DMI_SBCS, 0, false, false) != ERROR_OK)
++		bool sbbusyerror;
++		if (setup && get_field(setup_in, DTM_DMI_OP) == DMI_STATUS_BUSY) {
++			/* The DTM may have dropped the sbcs or sbaddress write, so sbaddress may still hold an
++			 * earlier access's address; it has dropped every data write after them (busy is sticky).
++			 * Start the batch over. */
++			if (sb_batch_recover(target, &sbbusyerror) != ERROR_OK)
++				return ERROR_FAIL;
++			LOG_INFO("System bus write: DMI busy in the setup, retrying with %d idle cycles",
++					info->dmi_busy_delay);
++			next_address = batch_address;
++			continue;
++		}
++		if (setup && (get_field(setup_in, DTM_DMI_OP) != DMI_STATUS_SUCCESS ||
++				(uint32_t)get_field(setup_in, DTM_DMI_DATA) != (uint32_t)batch_address)) {
++			LOG_ERROR("Failed to set up a system bus write at 0x%" TARGET_PRIxADDR, batch_address);
+ 			return ERROR_FAIL;
++		}
+ 
+-		time_t start = time(NULL);
+-		bool dmi_busy = dmi_busy_encountered;
+-		while (get_field(sbcs, DMI_SBCS_SBBUSY) || dmi_busy) {
+-			if (time(NULL) - start > riscv_command_timeout_sec) {
+-				LOG_ERROR("Timed out after %ds waiting for sbbusy to go low (sbcs=0x%x). "
+-					  "Increase the timeout with riscv set_command_timeout_sec.",
+-					  riscv_command_timeout_sec, sbcs);
++		/* A DMI busy anywhere in the batch shows here too: it is sticky. */
++		dmi_status_t status = get_field(sbcs_in, DTM_DMI_OP);
++		uint32_t sbcs = get_field(sbcs_in, DTM_DMI_DATA);
++		if (status == DMI_STATUS_FAILED) {
++			LOG_ERROR("Failed system bus write at 0x%" TARGET_PRIxADDR, batch_address);
++			return ERROR_FAIL;
++		} else if (status == DMI_STATUS_BUSY) {
++			if (sb_batch_recover(target, &sbbusyerror) != ERROR_OK)
+ 				return ERROR_FAIL;
++			LOG_INFO("System bus write: DMI busy, resuming with %d idle cycles",
++					info->dmi_busy_delay);
++		} else {
++			if (!get_field(sbcs, DMI_SBCS_SBBUSYERROR) && get_field(sbcs, DMI_SBCS_SBBUSY) &&
++					next_address == end_address) {
++				/* The last bus write is still running: wait for it and its result. */
++				if (read_sbcs_nonbusy(target, &sbcs) != ERROR_OK)
++					return ERROR_FAIL;
+ 			}
+-
+-			if (dmi_op(target, &sbcs, &dmi_busy, DMI_OP_READ,
+-						DMI_SBCS, 0, false, true) != ERROR_OK)
++			if (get_field(sbcs, DMI_SBCS_SBERROR)) {
++				/* Some error indicating the bus access failed, but not because of
++				 * something we did wrong. */
++				dmi_write(target, DMI_SBCS, DMI_SBCS_SBERROR);
+ 				return ERROR_FAIL;
++			}
++			sbbusyerror = get_field(sbcs, DMI_SBCS_SBBUSYERROR);
++			if (sbbusyerror) {
++				uint32_t idle;
++				if (dmi_write(target, DMI_SBCS, DMI_SBCS_SBBUSYERROR) != ERROR_OK ||
++						read_sbcs_nonbusy(target, &idle) != ERROR_OK)
++					return ERROR_FAIL;
++			}
+ 		}
+ 
+-		if (get_field(sbcs, DMI_SBCS_SBBUSYERROR)) {
++		if (sbbusyerror) {
+ 			/* We wrote while the target was busy. Slow down and try again. */
+-			dmi_write(target, DMI_SBCS, DMI_SBCS_SBBUSYERROR);
+ 			info->bus_master_write_delay += info->bus_master_write_delay / 10 + 1;
++			LOG_INFO("System bus write: sbbusyerror, resuming with a bus write delay of %d",
++					info->bus_master_write_delay);
+ 		}
+-
+-		if (get_field(sbcs, DMI_SBCS_SBBUSYERROR) || dmi_busy_encountered) {
++		setup = status != DMI_STATUS_SUCCESS || sbbusyerror;
++		if (setup) {
+ 			next_address = sb_read_address(target);
+-			if (next_address < address) {
++			if (next_address < address || next_address > end_address) {
+ 				/* This should never happen, probably buggy hardware. */
+-				LOG_DEBUG("unexpected system bus address 0x%" TARGET_PRIxADDR,
+-					  next_address);
++				LOG_ERROR("unexpected system bus address 0x%" TARGET_PRIxADDR,
++						next_address);
+ 				return ERROR_FAIL;
+ 			}
+-
+-			continue;
+-		}
+-
+-		unsigned error = get_field(sbcs, DMI_SBCS_SBERROR);
+-		if (error != 0) {
+-			/* Some error indicating the bus access failed, but not because of
+-			 * something we did wrong. */
+-			dmi_write(target, DMI_SBCS, DMI_SBCS_SBERROR);
+-			return ERROR_FAIL;
+ 		}
++		if (next_address > batch_address)
++			start = time(NULL);
+ 	}
+ 
+ 	return ERROR_OK;
+diff --git a/src/target/semihosting_common.c b/src/target/semihosting_common.c
+index ce6a79171..ae2bbac8a 100644
+--- a/src/target/semihosting_common.c
++++ b/src/target/semihosting_common.c
+@@ -81,6 +81,8 @@ static uint64_t semihosting_get_field(struct target *target, size_t index,
+ static void semihosting_set_field(struct target *target, uint64_t value,
+ 	size_t index,
+ 	uint8_t *fields);
++static int semihosting_read_string(struct target *target, uint64_t addr,
++	bool print, size_t *len);
+ 
+ /* Attempts to include gdb_server.h failed. */
+ extern int gdb_actual_connections;
+@@ -1216,33 +1218,20 @@ int semihosting_common(struct target *target)
+ 			 * None. The RETURN REGISTER is corrupted.
+ 			 */
+ 			if (semihosting->is_fileio) {
+-				size_t count = 0;
+-				uint64_t addr = semihosting->param;
+-				for (;; addr++) {
+-					unsigned char c;
+-					retval = target_read_memory(target, addr, 1, 1, &c);
+-					if (retval != ERROR_OK)
+-						return retval;
+-					if (c == '\0')
+-						break;
+-					count++;
+-				}
++				size_t count;
++				retval = semihosting_read_string(target, semihosting->param, false, &count);
++				if (retval != ERROR_OK)
++					return retval;
+ 				semihosting->hit_fileio = true;
+ 				fileio_info->identifier = "write";
+ 				fileio_info->param_1 = 1;
+ 				fileio_info->param_2 = semihosting->param;
+ 				fileio_info->param_3 = count;
+ 			} else {
+-				uint64_t addr = semihosting->param;
+-				do {
+-					unsigned char c;
+-					retval = target_read_memory(target, addr++, 1, 1, &c);
+-					if (retval != ERROR_OK)
+-						return retval;
+-					if (!c)
+-						break;
+-					putchar(c);
+-				} while (1);
++				size_t count;
++				retval = semihosting_read_string(target, semihosting->param, true, &count);
++				if (retval != ERROR_OK)
++					return retval;
+ 				semihosting->result = 0;
+ 			}
+ 			break;
+@@ -1404,6 +1393,42 @@ static int semihosting_common_fileio_end(struct target *target, int result,
+ 	return semihosting->post_result(target);
+ }
+ 
++/**
++ * Read a NUL-terminated string from the target, for SYS_WRITE0: its length
++ * goes to *len and, with print, its characters to stdout. It is read in
++ * aligned 64-byte chunks of 32-bit words rather than one byte per access,
++ * which on a target whose system bus has no byte access (GAP9) costs a
++ * program-buffer round trip per byte. A chunk whose word read fails is read
++ * byte by byte.
++ */
++static int semihosting_read_string(struct target *target, uint64_t addr,
++	bool print, size_t *len)
++{
++	*len = 0;
++	for (;;) {
++		uint64_t chunk = addr & ~(uint64_t)63;
++		unsigned from = addr - chunk;
++		uint8_t buf[64];
++		if (target_read_memory(target, chunk, 4, 16, buf) != ERROR_OK) {
++			for (unsigned i = from; i < 64; i++) {
++				int retval = target_read_memory(target, chunk + i, 1, 1, buf + i);
++				if (retval != ERROR_OK)
++					return retval;
++				if (!buf[i])
++					break;
++			}
++		}
++		for (unsigned i = from; i < 64; i++) {
++			if (!buf[i])
++				return ERROR_OK;
++			if (print)
++				putchar(buf[i]);
++			(*len)++;
++		}
++		addr = chunk + 64;
++	}
++}
++
+ /**
+  * Read all fields of a command from target to buffer.
+  */
+diff --git a/src/target/target.c b/src/target/target.c
+index 3d375304b..970942dee 100644
+--- a/src/target/target.c
++++ b/src/target/target.c
+@@ -156,7 +156,8 @@ static struct target_event_callback *target_event_callbacks;
+ static struct target_timer_callback *target_timer_callbacks;
+ LIST_HEAD(target_reset_callback_list);
+ LIST_HEAD(target_trace_callback_list);
+-static const int polling_interval = 100;
++/* How often the targets are polled in the background, in ms (target_poll_interval). */
++static int polling_interval = 100;
+ 
+ static const Jim_Nvp nvp_assert[] = {
+ 	{ .name = "assert", NVP_ASSERT },
+@@ -2841,6 +2842,31 @@ static int handle_target(void *priv)
+ 	return retval;
+ }
+ 
++COMMAND_HANDLER(handle_target_poll_interval_command)
++{
++	if (CMD_ARGC > 1)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++	if (CMD_ARGC == 1) {
++		int ms;
++		COMMAND_PARSE_NUMBER(int, CMD_ARGV[0], ms);
++		if (ms < 1) {
++			LOG_ERROR("target_poll_interval: the interval must be at least 1 ms");
++			return ERROR_COMMAND_ARGUMENT_INVALID;
++		}
++		polling_interval = ms;
++		/* After init the poll timer is running: move it to the new interval. */
++		for (struct target_timer_callback *c = target_timer_callbacks; c; c = c->next) {
++			if (c->callback == handle_target && !c->removed) {
++				c->time_ms = ms;
++				gettimeofday(&c->when, NULL);
++				timeval_add_time(&c->when, 0, ms * 1000);
++			}
++		}
++	}
++	command_print(CMD, "target poll interval: %d ms", polling_interval);
++	return ERROR_OK;
++}
++
+ COMMAND_HANDLER(handle_reg_command)
+ {
+ 	struct target *target;
+@@ -5945,6 +5971,14 @@ static const struct command_registration target_command_handlers[] = {
+ 		.chain = target_subcommand_handlers,
+ 		.usage = "",
+ 	},
++	{
++		.name = "target_poll_interval",
++		.handler = handle_target_poll_interval_command,
++		.mode = COMMAND_ANY,
++		.help = "set or show the interval of the background target "
++			"polling, in ms (default 100)",
++		.usage = "[milliseconds]",
++	},
+ 	COMMAND_REGISTRATION_DONE
+ };
+ 

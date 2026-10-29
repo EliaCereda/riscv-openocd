@@ -7,7 +7,7 @@ GreenWaves GAP SDK 5.21.7 Makefile uses — packaged with
 `osx-arm64` and `osx-64`, published to
 [prefix.dev/eliacereda](https://prefix.dev/channels/eliacereda).
 
-Upstream source plus one GAP9 patch (`recipe/patches/`), configured as the SDK
+Upstream source plus two GAP9 patches (`recipe/patches/`), configured as the SDK
 does (`--enable-jtag_dpi --disable-werror`). The rest of the GAP9-specific
 logic is Tcl inside the SDK tree (`utils/openocd_tools/`).
 
@@ -22,6 +22,32 @@ settings, since the GAP9 Tcl runs it before `init`) makes
 step went from a loop's end back to its start, write the count minus one. Both
 loops ending on the same instruction (no compiler emits it) is left as is, with
 a warning.
+
+**The JTAG throughput patch** (build 4): on the GAP9 EVK, this openocd read
+memory over the system bus one word at a time with two USB round trips per
+word (15.5 KB/s at any adapter speed), wrote it in batches of 32 words, read
+each semihosting `SYS_WRITE0` string one byte per access (GAP9's system bus
+has no byte access, so each byte costs a program-buffer round trip), and
+polled the target every 100 ms, hard-coded (gap-llvm-toolchain JTAG report,
+2026-10-28). `0002` changes three things:
+- System bus reads and writes (sbversion 1, accesses up to 4 bytes for reads)
+  go in batches of up to 1023 words, one JTAG queue flush each. The sbcs
+  check is the last scan of each batch, and the per-call sbcs and sbaddress
+  setup is the first (a write reads sbaddress back right after it), so a read
+  of up to 1023 words is two flushes instead of two per word plus ~15. A DMI busy or an sbbusyerror restarts at the first
+  lost word with more idle cycles, as upstream's write path does; the last
+  word of a read is read after `sbreadondata` is cleared, so no bus read goes
+  past the end.
+- `SYS_WRITE0` strings are read in aligned 64-byte chunks of 32-bit words (a
+  chunk whose word read fails falls back to bytes).
+- `target_poll_interval [ms]` sets the background target poll (default
+  100 ms, unchanged). A debug session can poll faster to notice halts and
+  semihosting calls sooner; it also needs `poll_period` no longer than that.
+
+On the GAP9 EVK at 10 MHz (2026-10-29), against build 3: 1 MB reads
+15.5 -> 378 KB/s, 1 MB writes 214 -> 406 KB/s, a 512-byte read 34 -> 3 ms,
+a semihosting line 136 -> ~30 ms with a 10 ms poll; every transfer of a
+100 × 1 MB soak and of runs with injected DMI busy read back byte-exact.
 
 **Why this exact 2020 commit:** the SDK's Tcl scripts use pre-0.12 deprecated
 command spellings (`interface ftdi`, `ftdi_vid_pid`, `ftdi_layout_init`,
